@@ -1,0 +1,566 @@
+"""
+SmartLab Analytics — Dashboard
+Layer 4 (Visualization) of the SmartLab / EdgeSense AI pipeline.
+
+Run with:
+    streamlit run dashboard/app.py
+"""
+
+import os
+import glob
+import json
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+
+# ----------------------------------------------------------------------------
+# Page config & global style
+# ----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="SmartLab Analytics",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+BASE_DATA_PATH = os.path.join("data", "Projects")
+
+ACCENT = "#5B8CFF"
+ACCENT_SOFT = "#8FB2FF"
+BG = "#0E1117"
+CARD_BG = "#161B22"
+BORDER = "#2A2F3A"
+TEXT_MUTED = "#9AA4B2"
+
+PALETTE = px.colors.qualitative.Set2 + px.colors.qualitative.Set3
+
+CUSTOM_CSS = f"""
+<style>
+    .stApp {{
+        background-color: {BG};
+    }}
+
+    section[data-testid="stSidebar"] {{
+        background-color: {CARD_BG};
+        border-right: 1px solid {BORDER};
+    }}
+
+    div[data-testid="stMetric"] {{
+        background-color: {CARD_BG};
+        border: 1px solid {BORDER};
+        border-radius: 12px;
+        padding: 16px 18px;
+    }}
+    div[data-testid="stMetricLabel"] {{
+        color: {TEXT_MUTED} !important;
+    }}
+
+    h1, h2, h3 {{
+        letter-spacing: -0.02em;
+    }}
+
+    h1 span.accent {{
+        color: {ACCENT_SOFT};
+    }}
+
+    .smartlab-card {{
+        background-color: {CARD_BG};
+        border: 1px solid {BORDER};
+        border-radius: 14px;
+        padding: 20px 22px;
+        margin-bottom: 14px;
+    }}
+
+    .smartlab-badge {{
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 600;
+        background: rgba(91, 140, 255, 0.15);
+        color: {ACCENT_SOFT};
+        border: 1px solid rgba(91, 140, 255, 0.35);
+    }}
+
+    .smartlab-chip {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid {BORDER};
+        border-radius: 8px;
+        padding: 6px 10px;
+        margin-bottom: 6px;
+        font-size: 13px;
+    }}
+
+    .smartlab-muted {{
+        color: {TEXT_MUTED};
+        font-size: 13px;
+    }}
+
+    .stButton > button {{
+        background-color: {ACCENT};
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        padding: 0.5rem 1.2rem;
+    }}
+    .stButton > button:hover {{
+        background-color: {ACCENT_SOFT};
+        color: black;
+    }}
+
+    footer {{visibility: hidden;}}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
+# Data access helpers
+# ----------------------------------------------------------------------------
+def list_projects():
+    if not os.path.exists(BASE_DATA_PATH):
+        return []
+    return sorted(
+        d for d in os.listdir(BASE_DATA_PATH)
+        if os.path.isdir(os.path.join(BASE_DATA_PATH, d))
+    )
+
+
+def load_project_metadata(project: str):
+    path = os.path.join(BASE_DATA_PATH, project, "project_metadata.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def list_sensors(project: str):
+    path = os.path.join(BASE_DATA_PATH, project, "Sensors")
+    if not os.path.exists(path):
+        return []
+    return sorted(
+        d for d in os.listdir(path)
+        if os.path.isdir(os.path.join(path, d))
+    )
+
+
+def load_sensor_metadata(project: str, sensor: str):
+    path = os.path.join(BASE_DATA_PATH, project, "Sensors", sensor, "metadata.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def list_data_files(project: str, sensor: str):
+    path = os.path.join(BASE_DATA_PATH, project, "Sensors", sensor)
+    files = sorted(glob.glob(os.path.join(path, "*.csv")))
+    return [os.path.basename(f) for f in files]
+
+
+@st.cache_data(show_spinner=False)
+def load_csv(project: str, sensor: str, filename: str) -> pd.DataFrame:
+    full_path = os.path.join(BASE_DATA_PATH, project, "Sensors", sensor, filename)
+    return pd.read_csv(full_path)
+
+
+def resolve_xy(df: pd.DataFrame):
+    """Pick the timestamp/value columns, or fall back to index / first column."""
+    cols_lower = {c.lower(): c for c in df.columns}
+    ts_col = cols_lower.get("timestamp")
+    val_col = cols_lower.get("value")
+
+    if ts_col and val_col:
+        x = pd.to_datetime(df[ts_col], errors="coerce")
+        if x.isna().all():
+            x = df[ts_col]
+        y = df[val_col]
+        return x, y, ts_col, val_col
+
+    x = df.index
+    y = df.iloc[:, 0]
+    return x, y, "index", df.columns[0]
+
+
+@st.cache_data(show_spinner=False)
+def load_series(project: str, sensor: str, filenames: tuple) -> pd.DataFrame:
+    """Load & concatenate one or more CSV files for a single sensor into one
+    continuous, time-sorted series with columns [x, y]."""
+    frames = []
+    for fname in filenames:
+        raw = load_csv(project, sensor, fname)
+        if raw.empty:
+            continue
+        x, y, x_label, y_label = resolve_xy(raw)
+        frames.append(pd.DataFrame({"x": x, "y": pd.to_numeric(y, errors="coerce")}))
+
+    if not frames:
+        return pd.DataFrame(columns=["x", "y"])
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # If x looks like real timestamps, sort chronologically; otherwise keep
+    # file order and re-index sequentially so multi-day files line up.
+    if pd.api.types.is_datetime64_any_dtype(combined["x"]):
+        combined = combined.sort_values("x").reset_index(drop=True)
+    else:
+        combined = combined.reset_index(drop=True)
+        combined["x"] = combined.index
+
+    return combined
+
+
+def short_label(project: str, sensor: str) -> str:
+    return f"{project.replace('_', ' ')} · {sensor.replace('_', ' ')}"
+
+
+# ----------------------------------------------------------------------------
+# Session state for the comparison "series builder"
+# ----------------------------------------------------------------------------
+if "series" not in st.session_state:
+    st.session_state.series = []  # list of {project, sensor, files: [...], label}
+
+
+# ----------------------------------------------------------------------------
+# Sidebar — navigation / selection
+# ----------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### 🧪 SmartLab Analytics")
+    st.caption("EdgeSense AI · local-first research platform")
+    st.divider()
+
+    projects = list_projects()
+
+    if not projects:
+        st.warning(
+            f"No projects found under `{BASE_DATA_PATH}`.\n\n"
+            "Generate mock data or check your working directory."
+        )
+        st.stop()
+
+    compare_mode = st.toggle("🔀 Compare several sources", value=False)
+
+    st.divider()
+
+    if not compare_mode:
+        # --- Single-source mode -------------------------------------------
+        project = st.selectbox("📁 Project", projects)
+
+        sensors = list_sensors(project)
+        if not sensors:
+            st.warning("This project has no Sensors folder yet.")
+            st.stop()
+
+        sensor = st.selectbox("📡 Sensor", sensors)
+
+        files = list_data_files(project, sensor)
+        if not files:
+            st.warning("No CSV log files found for this sensor.")
+            st.stop()
+
+        filename = st.selectbox("🗓️ Data file", files, index=len(files) - 1)
+
+    else:
+        # --- Comparison mode: build a list of series -----------------------
+        st.markdown("**➕ Add series for comparison**")
+
+        cmp_project = st.selectbox("Project", projects, key="cmp_project")
+        cmp_sensors = list_sensors(cmp_project)
+
+        if not cmp_sensors:
+            st.info("There are no sensors in this project.")
+        else:
+            cmp_sensor = st.selectbox("Sensor", cmp_sensors, key="cmp_sensor")
+            cmp_files = list_data_files(cmp_project, cmp_sensor)
+
+            if not cmp_files:
+                st.info("There are no CSV files for this sensor.")
+            else:
+                cmp_selected_files = st.multiselect(
+                    "Files (will be combined into a single series)",
+                    cmp_files,
+                    default=cmp_files,
+                    key="cmp_files",
+                )
+
+                if st.button("➕ Add to comparison", use_container_width=True):
+                    if not cmp_selected_files:
+                        st.warning("Please select at least one file.")
+                    else:
+                        key = (cmp_project, cmp_sensor)
+                        existing_keys = {(s["project"], s["sensor"]) for s in st.session_state.series}
+                        if key in existing_keys:
+                            st.info("This sensor is already added to the comparison.")
+                        else:
+                            st.session_state.series.append({
+                                "project": cmp_project,
+                                "sensor": cmp_sensor,
+                                "files": cmp_selected_files,
+                                "label": short_label(cmp_project, cmp_sensor),
+                            })
+                            st.rerun()
+
+        st.divider()
+        st.markdown(f"**Selected series: {len(st.session_state.series)}**")
+
+        for i, s in enumerate(st.session_state.series):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(
+                    f"<div class='smartlab-chip'>🎨 {s['label']}"
+                    f"<span class='smartlab-muted'> · {len(s['files'])} file(s)</span></div>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button("✕", key=f"remove_{i}"):
+                    st.session_state.series.pop(i)
+                    st.rerun()
+
+        if st.session_state.series and st.button("🗑️ Clear all", use_container_width=True):
+            st.session_state.series = []
+            st.rerun()
+
+    st.divider()
+    smoothing = st.toggle("Smoothing (moving average)", value=False)
+    window = st.slider("Window size", 2, 50, 5, disabled=not smoothing)
+
+    normalize = False
+    if compare_mode:
+        normalize = st.toggle(
+            "Normalize (0–1)",
+            value=True,
+            help="Useful if the series have different units of measurement (°C, %, hPa, etc.).",
+        )
+
+    st.divider()
+    st.caption(f"Last refreshed · {datetime.now().strftime('%H:%M:%S')}")
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
+
+
+# ============================================================================
+# COMPARISON MODE
+# ============================================================================
+if compare_mode:
+    st.markdown("# 🔀 Comparison <span class='accent'>of multiple sources</span>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='smartlab-muted'>Add sensors from the sidebar — each will become a separate line on the chart.</div>",
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    if not st.session_state.series:
+        st.info("The comparison list is empty. Add a series from the sidebar.")
+        st.stop()
+
+    loaded = []
+    for s in st.session_state.series:
+        df_s = load_series(s["project"], s["sensor"], tuple(s["files"]))
+        if df_s.empty:
+            continue
+        y = df_s["y"]
+        y_plot = y.rolling(window=window, min_periods=1, center=True).mean() if smoothing else y
+        if normalize and y_plot.notna().any() and y_plot.max() != y_plot.min():
+            y_plot = (y_plot - y_plot.min()) / (y_plot.max() - y_plot.min())
+        loaded.append({**s, "x": df_s["x"], "y_raw": y, "y_plot": y_plot})
+
+    if not loaded:
+        st.error("Failed to load any of the selected series.")
+        st.stop()
+
+    # --- Summary table -------------------------------------------------
+    summary_rows = []
+    for item in loaded:
+        y = item["y_raw"]
+        summary_rows.append({
+            "Series": item["label"],
+            "Points": len(y),
+            "Mean": round(y.mean(), 3) if y.notna().any() else None,
+            "Std": round(y.std(), 3) if y.notna().any() else None,
+            "Min": round(y.min(), 3) if y.notna().any() else None,
+            "Max": round(y.max(), 3) if y.notna().any() else None,
+        })
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    st.write("")
+
+    # --- Overlay chart ---------------------------------------------------
+    st.markdown("<div class='smartlab-card'>", unsafe_allow_html=True)
+
+    fig = go.Figure()
+    for i, item in enumerate(loaded):
+        color = PALETTE[i % len(PALETTE)]
+        fig.add_trace(
+            go.Scatter(
+                x=item["x"],
+                y=item["y_plot"],
+                mode="lines",
+                line=dict(color=color, width=2),
+                name=item["label"],
+            )
+        )
+
+    fig.update_layout(
+        template="plotly_dark",
+        plot_bgcolor=CARD_BG,
+        paper_bgcolor=CARD_BG,
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=480,
+        yaxis_title="Normalized value (0–1)" if normalize else "Value",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=BORDER)
+    fig.update_yaxes(showgrid=True, gridcolor=BORDER)
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.expander("📄 Combined data for each series"):
+        for item in loaded:
+            st.markdown(f"**{item['label']}**")
+            st.dataframe(
+                pd.DataFrame({"x": item["x"], "value": item["y_raw"]}),
+                use_container_width=True,
+                height=200,
+            )
+
+    st.stop()
+
+
+# ============================================================================
+# SINGLE-SOURCE MODE
+# ============================================================================
+proj_meta = load_project_metadata(project)
+sensor_meta = load_sensor_metadata(project, sensor)
+
+st.markdown(f"# {project.replace('_', ' ')} <span class='accent'>· {sensor.replace('_', ' ')}</span>", unsafe_allow_html=True)
+
+goal = proj_meta.get("goal") or proj_meta.get("Goal")
+if goal:
+    st.markdown(f"<div class='smartlab-muted'>{goal}</div>", unsafe_allow_html=True)
+
+badges = []
+if "type" in sensor_meta or "Type" in sensor_meta:
+    badges.append(sensor_meta.get("type", sensor_meta.get("Type")))
+if proj_meta.get("author") or proj_meta.get("Author"):
+    badges.append(f"Author: {proj_meta.get('author', proj_meta.get('Author'))}")
+
+if badges:
+    st.markdown(
+        " ".join(f"<span class='smartlab-badge'>{b}</span>" for b in badges),
+        unsafe_allow_html=True,
+    )
+
+st.write("")
+
+try:
+    df = load_csv(project, sensor, filename)
+    if df.empty:
+        st.error("The selected CSV file is empty.")
+        st.stop()
+except Exception as e:
+    st.error(f"Failed to read data: {e}")
+    st.stop()
+
+x, y, x_label, y_label = resolve_xy(df)
+y_numeric = pd.to_numeric(y, errors="coerce")
+
+y_plot = y_numeric
+if smoothing:
+    y_plot = y_numeric.rolling(window=window, min_periods=1, center=True).mean()
+
+# --- KPI row ---------------------------------------------------------------
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Data points", f"{len(df):,}")
+k2.metric("Mean", f"{y_numeric.mean():.3f}" if y_numeric.notna().any() else "—")
+k3.metric("Std. dev", f"{y_numeric.std():.3f}" if y_numeric.notna().any() else "—")
+delta = None
+if len(y_numeric.dropna()) >= 2:
+    delta = f"{(y_numeric.dropna().iloc[-1] - y_numeric.dropna().iloc[0]):+.3f}"
+k4.metric("Min → Max", f"{y_numeric.min():.2f} → {y_numeric.max():.2f}", delta)
+
+st.write("")
+
+# --- Main chart --------------------------------------------------------------
+st.markdown("<div class='smartlab-card'>", unsafe_allow_html=True)
+
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(
+        x=x,
+        y=y_numeric,
+        mode="lines",
+        line=dict(color="rgba(91,140,255,0.35)", width=1),
+        name="raw",
+        showlegend=smoothing,
+    )
+)
+fig.add_trace(
+    go.Scatter(
+        x=x,
+        y=y_plot,
+        mode="lines+markers",
+        line=dict(color=ACCENT, width=2),
+        marker=dict(size=4),
+        name="smoothed" if smoothing else y_label,
+    )
+)
+
+fig.update_layout(
+    template="plotly_dark",
+    plot_bgcolor=CARD_BG,
+    paper_bgcolor=CARD_BG,
+    margin=dict(l=10, r=10, t=30, b=10),
+    height=440,
+    xaxis_title=x_label,
+    yaxis_title=y_label,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+)
+fig.update_xaxes(showgrid=True, gridcolor=BORDER)
+fig.update_yaxes(showgrid=True, gridcolor=BORDER)
+
+st.plotly_chart(fig, use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+# --- Details tabs --------------------------------------------------------
+tab_data, tab_meta, tab_ai = st.tabs(["📄 Raw data", "⚙️ Sensor metadata", "🤖 AI insights"])
+
+with tab_data:
+    st.dataframe(df, use_container_width=True, height=320)
+    st.download_button(
+        "Download CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=filename,
+        mime="text/csv",
+    )
+
+with tab_meta:
+    if sensor_meta:
+        st.json(sensor_meta)
+    else:
+        st.info("No metadata.json found for this sensor.")
+
+with tab_ai:
+    st.info(
+        "This tab is a hook for Layer 3 (`core/llm_analyzer.py`). "
+        "Wire it up to run `tsfresh` feature extraction + the local Ollama model "
+        "on the currently selected file, then render the returned Markdown/JSON here."
+    )
+    if st.button("Run local AI analysis"):
+        st.warning("Connect this button to `core.llm_analyzer` to generate real insights.")
