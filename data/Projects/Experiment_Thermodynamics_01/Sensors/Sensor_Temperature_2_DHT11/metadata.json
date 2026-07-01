@@ -1,0 +1,5 @@
+{
+  "sensor_id": "Sensor_Temperature",
+  "type": "K-Type Thermocouple",
+  "unit": "°C"
+}
